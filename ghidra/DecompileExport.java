@@ -34,7 +34,7 @@ public class DecompileExport extends GhidraScript {
         int maxDecomp = args.length > 4 ? Integer.parseInt(args[4]) : 60;
 
         new File(outDir).mkdirs();
-        int applied = 0;
+        int applied = 0, notApplied = 0;
 
         // ---- apply recovered symbols ----
         if (symsPath != null && new File(symsPath).exists()) {
@@ -51,6 +51,15 @@ public class DecompileExport extends GhidraScript {
                     } catch (NumberFormatException e) {
                         continue;
                     }
+                    // The symbols TSV holds RVAs (that is what qvmtool emits project-wide),
+                    // but Ghidra addresses are absolute. Feeding an RVA straight to toAddr()
+                    // silently addressed memory below the image, so NOT A SINGLE NAME FROM
+                    // 5,028 APPLIED -- and because the run still reported "applied 5028",
+                    // the failure looked like success. Rebase anything that cannot be a VA.
+                    long imageBase = currentProgram.getImageBase().getOffset();
+                    if (addr < imageBase) {
+                        addr += imageBase;
+                    }
                     String name = f[1];
                     String kind = f[2];
                     String detail = f.length > 3 ? f[3] : "";
@@ -66,14 +75,29 @@ public class DecompileExport extends GhidraScript {
                         }
                         createLabel(a, name, true, SourceType.USER_DEFINED);
                         setPlateComment(a, detail);
-                        applied++;
+                        // Count only what actually landed, by reading it back. The previous
+                        // unconditional increment reported "applied 5028" while zero names
+                        // were present in the program -- a counter that cannot fail is not a
+                        // check, and it turned a total failure into an apparent success.
+                        String landed = null;
+                        if (getFunctionAt(a) != null) {
+                            landed = getFunctionAt(a).getName();
+                        } else if (getSymbolAt(a) != null) {
+                            landed = getSymbolAt(a).getName();
+                        }
+                        if (name.equals(landed)) {
+                            applied++;
+                        } else {
+                            notApplied++;
+                        }
                     } catch (Exception e) {
-                        // duplicates and thunk conflicts are expected; keep going
+                        notApplied++;
                     }
                 }
             }
         }
-        println("DecompileExport: applied " + applied + " symbols");
+        println("DecompileExport: applied " + applied + " symbols, NOT applied "
+                + notApplied + " (verified by read-back)");
 
         // ---- decompiler health over the whole image ----
         DecompInterface di = new DecompInterface();
