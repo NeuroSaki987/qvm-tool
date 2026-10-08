@@ -138,6 +138,52 @@ class DeobfResult:
         }
 
 
+def _accumulate_shift(buf: bytes, buf_va: int, start: int, end: int, reg: str, md
+                      ) -> tuple[int, bool]:
+    """Net constant applied to `reg` over [start, end); returns (delta, trustworthy).
+
+    Why this exists: the backward `imm64` form used to report the raw immediate as the
+    target, ignoring the flags-neutral `add reg, imm32` that the engine puts between the
+    `mov` and the `jmp`. It therefore reported the **pre-shift** base -- a wrong target
+    that still lands inside the VM section, so an in-section sanity check passes and the
+    error stays invisible. A delegated validation against executed ground truth found
+    exactly that failure mode on the sibling engine (0 of 213 resolved sites correct).
+
+    The second return value matters as much as the first: if anything else writes the
+    register inside the window the model is void, and reporting a target anyway would be
+    a guess. Callers must treat `ok=False` as unresolved.
+    """
+    from capstone.x86 import X86_OP_IMM, X86_OP_MEM, X86_OP_REG, X86_REG_INVALID, X86_REG_RIZ
+
+    #: mnemonics that read their operands without writing the first one
+    NON_WRITING = ("cmp", "test", "push", "call", "jmp", "bt", "nop", "ret")
+
+    delta = 0
+    for ins in md.disasm(buf[start:end], buf_va + start):
+        ops = ins.operands
+        if ins.mnemonic in ("add", "sub") and len(ops) == 2 \
+                and ops[0].type == X86_OP_REG \
+                and ins.reg_name(ops[0].reg) == reg \
+                and ops[1].type == X86_OP_IMM:
+            step = ops[1].imm
+            delta += step if ins.mnemonic == "add" else -step
+            continue
+        if ins.mnemonic == "lea" and len(ops) == 2 \
+                and ops[0].type == X86_OP_REG \
+                and ins.reg_name(ops[0].reg) == reg \
+                and ops[1].type == X86_OP_MEM \
+                and ops[1].mem.base \
+                and ins.reg_name(ops[1].mem.base) == reg \
+                and ops[1].mem.index in (X86_REG_INVALID, X86_REG_RIZ):
+            delta += ops[1].mem.disp
+            continue
+        writes = ops and ops[0].type == X86_OP_REG \
+            and ins.reg_name(ops[0].reg) == reg
+        if writes and ins.mnemonic not in NON_WRITING:
+            return delta, False
+    return delta, True
+
+
 def _jmp_sites(buf: bytes) -> list[tuple[int, str, int]]:
     """(offset, register-name, opcode-kind) for every register-indirect jmp.
 
@@ -322,12 +368,36 @@ def resolve_hidden_branches(buf: bytes, buf_va: int, vm_va_lo: int, vm_va_hi: in
             handled_sites.add(jmp_va - buf_va)
 
     # ---------- backward-anchored forms: riplea / imm64 ----------
+    #
+    # These forms search BACKWARD from the jmp for a byte pattern that materialises the
+    # target. Unlike the forward `selfpc` form there is no structural guarantee that the
+    # match is real: `49 B8 ..` can occur inside unrelated code, and the "immediate" is
+    # then just the following garbage. Measured on the reference samples, every imm64
+    # match without decode validation produced a target far outside the image
+    # (e.g. 0xE2FF4166F5C166FB) and was still being counted as a real edge.
+    #
+    # So both forms now DECODE the candidate and require it to be the instruction they
+    # claim, writing the SAME register the jmp uses, and require the resulting target to
+    # be a plausible in-image address. Refusing is correct: an unresolved site is honest,
+    # a fabricated target is not.
+    img_lo, img_hi = buf_va, buf_va + (1 << 32)   # any VA in the low 4 GB of the image
+
+    from capstone.x86 import (X86_OP_IMM, X86_OP_MEM, X86_OP_REG, X86_REG_INVALID,
+                              X86_REG_RIP, X86_REG_RIZ)
+
+    def _decode_at(offset: int):
+        raw = buf[offset:offset + 16]
+        if len(raw) < 8:
+            return None
+        return next(md.disasm(raw, buf_va + offset, count=1), None)
+
     for off, reg, _kind in sites:
         if off in handled_sites:
             continue
         lo = max(0, off - BACKWARD_WINDOW)
         window = buf[lo:off]
         best = None
+
         if "riplea" in forms:
             for pat in LEA_RIP:
                 j = window.rfind(pat)
@@ -336,10 +406,20 @@ def resolve_hidden_branches(buf: bytes, buf_va: int, vm_va_lo: int, vm_va_hi: in
                 gap = len(window) - (j + 7)
                 if gap > MAX_LEA_GAP:
                     continue
-                disp = struct.unpack_from("<i", buf, lo + j + 3)[0]
-                tgt = buf_va + lo + j + 7 + disp
+                ins = _decode_at(lo + j)
+                if ins is None or ins.mnemonic != "lea" or len(ins.operands) != 2:
+                    continue
+                if ins.reg_name(ins.operands[0].reg) != reg:
+                    continue
+                mem = ins.operands[1]
+                if mem.type != X86_OP_MEM or mem.mem.base != X86_REG_RIP:
+                    continue
+                tgt = ins.address + ins.size + mem.mem.disp
+                if not (img_lo <= tgt < img_hi):
+                    continue
                 if best is None or gap < best[0]:
-                    best = (gap, tgt, "riplea", buf_va + lo + j)
+                    best = (gap, tgt, "riplea", ins.address)
+
         if best is None and "imm64" in forms:
             for pat in MOV_IMM64:
                 j = window.rfind(pat)
@@ -348,9 +428,28 @@ def resolve_hidden_branches(buf: bytes, buf_va: int, vm_va_lo: int, vm_va_hi: in
                 gap = len(window) - (j + 10)
                 if gap > MAX_IMM_GAP:
                     continue
-                imm = struct.unpack_from("<Q", buf, lo + j + 2)[0]
+                ins = _decode_at(lo + j)
+                # capstone spells the 64-bit-immediate form `movabs`, not `mov`; checking
+                # only for "mov" silently rejected every real instance of this idiom.
+                if ins is None or ins.mnemonic not in ("mov", "movabs") \
+                        or len(ins.operands) != 2:
+                    continue
+                if ins.reg_name(ins.operands[0].reg) != reg:
+                    continue
+                if ins.operands[1].type != X86_OP_IMM:
+                    continue
+                # The engine shifts the loaded constant with a flags-neutral
+                # `add reg, imm32` before jumping, so the raw immediate is the
+                # PRE-shift base. Without this the target is wrong yet may still land
+                # inside the section, which is how the error stays invisible.
+                shift, ok = _accumulate_shift(buf, buf_va, lo + j + ins.size, off, reg, md)
+                if not ok:
+                    continue          # register redefined: refuse rather than guess
+                tgt = ins.operands[1].imm + shift
+                if not (img_lo <= tgt < img_hi):
+                    continue
                 if best is None or gap < best[0]:
-                    best = (gap, imm, "imm64", buf_va + lo + j)
+                    best = (gap, tgt, "imm64", ins.address)
         if best is None:
             res.unresolved += 1
             continue

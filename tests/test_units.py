@@ -381,3 +381,64 @@ def test_patch_span_covers_only_the_shift_and_jump_tail():
     assert start == va + 5 + 7 + 2          # the `add`, not the `call`
     assert end == va + len(buf)
     assert start > b.anchor                 # the call and junk stay untouched
+
+
+# -------------------------------------------- backward-form decode validation
+
+def test_backward_imm64_rejects_a_coincidental_byte_pattern():
+    """A `49 B8` byte pattern inside unrelated code must not become an edge.
+
+    Measured on the reference samples: before decode validation, EVERY imm64 match
+    produced a target far outside the image (e.g. 0xE2FF4166F5C166FB) and was still
+    counted as a real edge. The pattern `49 B8 ..` occurs inside unrelated code and the
+    "immediate" is then just the following garbage.
+    """
+    from qvmtool import deobf
+    va = 0x180000000
+    buf = bytearray(b"\x90" * 0x80)
+    # fabricate the pattern: `49 B8` + 8 junk bytes + `41 FF E0` (jmp r8)
+    buf[0x10:0x12] = b"\x49\xb8"
+    buf[0x12:0x1A] = b"\xfb\x66\xc1\xf5\x66\x41\xff\xe2"      # junk "immediate"
+    buf[0x1A:0x1D] = b"\x41\xff\xe0"                           # jmp r8
+    r = deobf.resolve_hidden_branches(bytes(buf), va, va + len(buf), va + len(buf))
+    # the decoded instruction at 0x10 may legitimately be a movabs whose immediate is
+    # junk; what must NOT happen is a resolved edge pointing outside the image
+    for b in r.branches:
+        assert va <= b.target < va + (1 << 32), \
+            f"fabricated out-of-image target accepted: 0x{b.target:X}"
+
+
+def test_backward_imm64_accumulates_add_shift_on_movabs():
+    """The engine shifts the loaded constant with `add reg, imm32` before jumping.
+
+    Two traps are covered here: capstone spells the 64-bit form `movabs` (checking only
+    for `mov` silently rejected every real instance), and reporting the RAW immediate
+    gives the pre-shift base -- a wrong target that can still land inside the section.
+    """
+    from qvmtool import deobf
+    va = 0x180000000
+    base = va + 0x2000
+    buf = bytearray(b"\x90" * 0x60)
+    buf[0x10:0x12] = b"\x48\xb8"                       # movabs rax, base
+    buf[0x12:0x1A] = base.to_bytes(8, "little")
+    buf[0x1A:0x1D] = b"\x48\x81\xc0\x10\x00\x00\x00"   # add rax, 0x10
+    buf[0x21:0x23] = b"\xff\xe0"                       # jmp rax
+    r = deobf.resolve_hidden_branches(bytes(buf), va, va + len(buf), va + len(buf))
+    imm = [b for b in r.branches if b.form == "imm64"]
+    assert len(imm) == 1, [b.to_dict() for b in r.branches]
+    assert imm[0].target == base + 0x10, \
+        f"shift not accumulated: got 0x{imm[0].target:X}, want 0x{base + 0x10:X}"
+
+
+def test_backward_imm64_refuses_when_the_register_is_redefined():
+    """If something else writes the register the model is void -- refuse, do not guess."""
+    from qvmtool import deobf
+    va = 0x180000000
+    buf = bytearray(b"\x90" * 0x60)
+    buf[0x10:0x12] = b"\x48\xb8"
+    buf[0x12:0x1A] = (va + 0x1000).to_bytes(8, "little")
+    buf[0x1A:0x1D] = b"\x48\x31\xc0"                   # xor rax, rax  (redefines rax)
+    buf[0x1D:0x1F] = b"\xff\xe0"                       # jmp rax
+    r = deobf.resolve_hidden_branches(bytes(buf), va, va + len(buf), va + len(buf))
+    assert not [b for b in r.branches if b.form == "imm64"], \
+        "a redefined register must not yield a target"
