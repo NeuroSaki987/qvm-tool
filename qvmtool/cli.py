@@ -118,7 +118,7 @@ def cmd_tvm(args) -> int:
         _write(os.path.join(outdir, "inject_tvm_edges.java"),
                ghidra_mod.emit_cfg_edges_java(
                    [(e.site, e.target, e.kind) for e in edge_list], pm.base,
-                   make_functions=not args.no_functions))
+                   make_functions=args.make_functions))
         _write(os.path.join(outdir, "inject_tvm_edges.idc"),
                ghidra_mod.emit_cfg_edges_idc(
                    [(e.site, e.target, e.kind) for e in edge_list], pm.base))
@@ -419,7 +419,7 @@ def cmd_edges(args) -> int:
     _write(os.path.join(outdir, "inject_qvm_edges.java"),
            ghidra_mod.emit_cfg_edges_java(
                [(e.site, e.target, e.kind) for e in kept], pm.base,
-               make_functions=not args.no_functions))
+               make_functions=args.make_functions))
     _write(os.path.join(outdir, "inject_qvm_edges.idc"),
            ghidra_mod.emit_cfg_edges_idc(
                [(e.site, e.target, e.kind) for e in kept], pm.base))
@@ -569,8 +569,11 @@ def build_parser() -> argparse.ArgumentParser:
     tv.add_argument("-o", "--output", help="output directory")
     tv.add_argument("--edges", action="store_true",
                     help="also emit edges TSV + Ghidra/IDA injection scripts")
-    tv.add_argument("--no-functions", action="store_true",
-                    help="do not create functions at recovered targets")
+    tv.add_argument("--make-functions", action="store_true",
+                    help="also create functions at recovered edge targets. OFF by "
+                         "default: measured to be a regression on the QVM side "
+                         "(jumptable warnings 123 -> 659, existing functions lose 88 "
+                         "instructions and 5 blocks)")
     tv.set_defaults(func=cmd_tvm)
 
     f = sub.add_parser("functions", help="recover the function map")
@@ -611,8 +614,14 @@ def build_parser() -> argparse.ArgumentParser:
     e.add_argument("--window", type=int, default=4096)
     e.add_argument("--max-anchors", type=int, default=8)
     e.add_argument("--max-instrs", type=int, default=512)
-    e.add_argument("--no-functions", action="store_true",
-                   help="do not create functions at recovered targets")
+    e.add_argument("--make-functions", action="store_true",
+                   help="also create functions at recovered edge targets. OFF by "
+                        "default because it is measurably a REGRESSION: jumptable "
+                        "warnings 123 -> 659, (code *) casts 397 -> 978, and the "
+                        "pre-existing functions lose 88 instructions and 5 basic "
+                        "blocks -- only ~3 of 535 targets sits inside any function, "
+                        "so the injected COMPUTED_JUMP reference has no successor to "
+                        "attach to")
     e.add_argument("--from-edges", help="reuse an existing edges.tsv instead of "
                                         "re-running the (slow) static pipeline")
     e.add_argument("--dynamic", help="merge a dynamic_edges.tsv (from the `dynamic` "
