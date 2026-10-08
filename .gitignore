@@ -1,0 +1,42 @@
+# byte-compiled / caches
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# analysis output: never commit sample-derived artefacts
+out/
+*.qvm
+*.edges/
+*.dynamic/
+*.survey/
+*.symbols.json
+*.symbols.tsv
+*.apply_ghidra.py
+*.apply_ida.idc
+*.funcs.tsv
+*.qvmrefs.json
+*.qvmhits.json
+*.qvmstats.json
+*_depatched.dll
+*.manifest.json
+decomp/
+
+# Ghidra project state
+*.gpr
+*.rep/
+ghidra_proj/
+
+# editor / OS
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+desktop.ini

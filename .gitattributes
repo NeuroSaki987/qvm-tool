@@ -1,0 +1,14 @@
+# Normalise line endings in the repository, not in the working tree.
+* text=auto
+
+*.py    text diff=python
+*.md    text
+*.toml  text
+*.java  text
+*.idc   text
+
+# Sample-derived analysis output must never be committed as binary either;
+# .gitignore already excludes these paths, this is a second line of defence.
+*.dll   binary
+*.sys   binary
+*.exe   binary
